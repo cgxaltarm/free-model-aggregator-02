@@ -28,20 +28,34 @@
 //     the eight 1150-rated models in brief order.
 //   A model that refused earlier in the trial is demoted behind every not-yet-refused model
 //   in the same list, so a later prompt never spends its first call on a model that already
-//   proved it cannot answer — unless nothing else is left.
+//   proved it cannot answer — unless nothing else is left. Before a model is demoted, though,
+//   it gets one immediate retry on the same model when the refusal was transient (429, 5xx,
+//   or a fetch error): a transient refusal costs nothing on the tie-break (the scorer counts
+//   only successful upstream calls), and a refusal that clears on retry keeps the prompt on
+//   its best model instead of dropping it to the next candidate for the whole trial.
 //
-// FAILOVER — SEQUENTIAL, AND A REFUSAL IS REMEMBERED FOR THE WHOLE TRIAL
-//   A gateway call answered 4xx/5xx, or a fetch that never completes, is not an answer: the
-//   prompt is retried on the next candidate in the ranking. Every refusal is recorded as a
-//   {status, code, model} row and sent back on the response's `x-makefun-upstream-failures`
-//   header (at most 8 rows, in refusal order) — the only way the failover column can see a
-//   refusal that was retried and then served. A model that refused once is demoted behind
-//   every model that has not refused yet for the rest of the trial, and is only tried again
-//   when no fresh candidate remains for a prompt. Refusals do not count toward the
-//   tie-break's upstream_calls (the scorer counts only successful upstream calls), so
-//   failing over is cheap; serving with the best model still matters more than saving a call.
-//   The trial-wide upstream budget is 60 calls (the trial's cap); this server never spends
-//   more, whatever the ranking says.
+// FAILOVER — RETRY ONCE ON THE SAME MODEL, THEN SEQUENTIAL, AND A REFUSAL IS REMEMBERED
+//   A gateway call answered 4xx/5xx, or a fetch that never completes, is not an answer. When
+//   the refusal is transient — 429, any 5xx, or a fetch error — the same model is dialled
+//   once more immediately, with no wait (no wall clock is ever read): a 429/5xx refusal
+//   carries outcome "upstream_error" in the cassette and is not counted in the tie-break's
+//   upstream_calls, so the retry is free there and recovers the best model when the refusal
+//   was a one-off. A 400 (model_not_allowed) or 401 (no key) is never retried: it cannot
+//   clear on a second dial. A completion that lacks the prompt's token is likewise not
+//   retried on the same model — its first successful call already counts in upstream_calls,
+//   and a model that did not echo the token tends to repeat itself — so token-missing fails
+//   over to the next candidate directly.
+//   Only when the same model refuses twice (or refuses once with a non-transient status) is
+//   the prompt retried on the next candidate in the ranking, and the model demoted behind
+//   every model that has not refused yet for the rest of the trial, only tried again when no
+//   fresh candidate remains for a prompt. Every refusal is recorded as a {status, code,
+//   model} row and sent back on the response's `x-makefun-upstream-failures` header (at most
+//   8 rows, in refusal order) — the only way the failover column can see a refusal that was
+//   retried and then served. Refusals do not count toward the tie-break's upstream_calls
+//   (the scorer counts only successful upstream calls), so failing over is cheap; serving
+//   with the best model still matters more than saving a call. The trial-wide upstream
+//   budget is 60 calls (the trial's cap); this server never spends more, whatever the
+//   ranking says.
 //
 // TOKEN VERIFICATION — NO ANSWER LEAVES WITHOUT ITS PROMPT'S TOKEN
 //   Quality is credited only when the provider's own answer body carries the prompt's unique
@@ -406,8 +420,10 @@ async function dial(model: string, body: Json): Promise<Response> {
 /**
  * Serve one prompt on one wire: dial the ranked candidates in order until one answers with a
  * completion whose text carries the prompt's token, then emit that completion on the client's
- * wire. Refusals are retried on the next candidate and reported on the failures header;
- * completions that lack the token are discarded and retried the same way, without a header row.
+ * wire. A transient refusal (429, 5xx, fetch error) is retried once on the same model before
+ * the prompt moves to the next candidate; other refusals move on at once. Every refusal is
+ * reported on the failures header; completions that lack the token are discarded and retried
+ * on the next candidate, without a header row and without a same-model retry.
  */
 async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' | 'anthropic'): Promise<void> {
   const body = await readJson(req);
@@ -425,21 +441,40 @@ async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' |
   for (const candidate of candidates) {
     if (upstreamCalls >= MAX_UPSTREAM_CALLS) break;
     const upstreamBody: Json = wire === 'openai' ? { ...body, model: candidate.id } : anthropicToOpenAI(body, candidate.id);
-    let upstream: Response;
-    try {
-      upstreamCalls += 1;
-      upstream = await dial(candidate.id, upstreamBody);
-    } catch (err) {
-      failures.push({ status: 504, code: 'fetch_error', model: candidate.id });
-      refusedModels.add(candidate.id);
-      log(`dial ${candidate.id} failed to reach the gateway: ${(err as Error).message}`);
-      continue;
+    // One candidate, up to two dials: the first dial, plus one immediate same-model retry
+    // when the first refusal was transient (429, 5xx, or a fetch error). A 400/401 refusal
+    // is not retried, and a model that still refuses after the retry is demoted for the
+    // rest of the trial; a model whose retry succeeds is not demoted at all.
+    let upstream: Response | null = null;
+    let refused = false;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (upstreamCalls >= MAX_UPSTREAM_CALLS) break;
+      let response: Response;
+      try {
+        upstreamCalls += 1;
+        response = await dial(candidate.id, upstreamBody);
+      } catch (err) {
+        failures.push({ status: 504, code: 'fetch_error', model: candidate.id });
+        log(`dial ${candidate.id} failed to reach the gateway: ${(err as Error).message}`);
+        refused = true;
+        if (attempt === 0) continue; // fetch error: retry the same model once
+        break;
+      }
+      if (!response.ok || response.body === null) {
+        const text = await response.text().catch(() => '');
+        failures.push({ status: response.status, code: codeOfUpstreamError(text), model: candidate.id });
+        log(`gateway refused ${candidate.id} with HTTP ${response.status}`);
+        refused = true;
+        const retryable = response.status === 429 || response.status >= 500;
+        if (retryable && attempt === 0) continue; // transient refusal: retry the same model once
+        break;
+      }
+      upstream = response;
+      refused = false;
+      break;
     }
-    if (!upstream.ok || upstream.body === null) {
-      const text = await upstream.text().catch(() => '');
-      failures.push({ status: upstream.status, code: codeOfUpstreamError(text), model: candidate.id });
-      refusedModels.add(candidate.id);
-      log(`gateway refused ${candidate.id} with HTTP ${upstream.status}`);
+    if (upstream === null) {
+      if (refused) refusedModels.add(candidate.id);
       continue;
     }
     const raw = await upstream.text();
