@@ -1,0 +1,4 @@
+# Raw validation outputs (large, machine-generated, never committed).
+validation/grade-local/
+validation/mock-trial-*/
+validation/scores-*/
