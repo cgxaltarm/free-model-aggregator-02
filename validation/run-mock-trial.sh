@@ -5,13 +5,16 @@
 #   3. run entry/main.ts against both (it registers, serves 6/6, exits 0 on /work done)
 #   4. SIGTERM the env so it exports state.json, build a cassette from the mock log,
 #      score with program/scorer/score.mjs
-# Usage: ./run-mock-trial.sh <trial 0|1|2> <run label, e.g. A>
+# Usage: ./run-mock-trial.sh <trial 0|1|2> <run label, e.g. A> [mock flags, default --refuse-first]
+#   Mock flags: --refuse-first | --refuse-502-twice | --refuse-502-always,
+#   optionally plus --double-finish (stream answers carry two finish chunks).
 # Output: entry/validation/mock-trial-<trial>-<label>/
 set -u
 KIT="$HOME/workspace/makefun/free-model-aggregator-02/kit/free-model-aggregator-02-kit"
 ENTRY="$HOME/workspace/makefun/free-model-aggregator-02/entry"
 N="$1"
 LABEL="$2"
+MOCK_FLAGS="${3:---refuse-first}"
 OUT="$ENTRY/validation/mock-trial-$N-$LABEL"
 STATE="$OUT/state"
 SCORES="$OUT/scores"
@@ -30,7 +33,7 @@ if [ ! -f "$STATE/ready" ]; then echo "ENV DID NOT START"; cat "$OUT/env.log"; k
 ENV_URL="http://127.0.0.1:$(python3 -c "import json;print(json.load(open('$STATE/ready'))['port'])")"
 echo "env up: $ENV_URL"
 
-node /tmp/mock-gateway.mjs --port "$MOCK_PORT" --log "$OUT/mock-gateway.log" --refuse-first > "$OUT/mock.log" 2>&1 &
+node /tmp/mock-gateway.mjs --port "$MOCK_PORT" --log "$OUT/mock-gateway.log" $MOCK_FLAGS > "$OUT/mock.log" 2>&1 &
 MOCK_PID=$!
 sleep 0.5
 kill -0 $MOCK_PID 2>/dev/null || { echo "MOCK DID NOT START"; cat "$OUT/mock.log"; kill $ENV_PID 2>/dev/null; exit 1; }

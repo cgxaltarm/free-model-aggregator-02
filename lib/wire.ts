@@ -260,8 +260,15 @@ export function sseEvent(event: string | null, data: unknown): string {
  * One SSE frame with every data payload's `model` set to `model`, and its blank line kept: comments,
  * `event:` lines and payloads that are not JSON objects pass through untouched. Chat Completions names
  * the model on its chunks; the client sees the id the entry dialled, never the provider's spelling.
+ *
+ * A stream carries exactly one finish chunk: a provider that sends a second chunk with a
+ * finish_reason (super-vl sends one without usage, then one with usage) would make the client
+ * count two finish chunks and fail the stream's order check, so the second and later finish
+ * reasons are nulled out — the chunk itself, its usage and its native_finish_reason stay, and
+ * the first finish reason is the stream's stop reason. The state is per stream, so the same
+ * frames always give the same bytes.
  */
-function frameWithModel(frame: string, model: string): string {
+function frameWithModel(frame: string, model: string, state: { sawFinish: boolean }): string {
   const lines = frame.split('\n').map((line) => {
     const trimmed = line.trim();
     if (!trimmed.startsWith('data:')) return line;
@@ -269,7 +276,15 @@ function frameWithModel(frame: string, model: string): string {
     if (payload === '' || payload === '[DONE]') return line;
     try {
       const chunk: unknown = JSON.parse(payload);
-      if (isRecord(chunk)) return `data: ${JSON.stringify({ ...chunk, model })}`;
+      if (isRecord(chunk)) {
+        const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+        const choice = isRecord(choices[0]) ? choices[0] : null;
+        if (choice !== null && typeof choice.finish_reason === 'string') {
+          if (state.sawFinish) choice.finish_reason = null;
+          else state.sawFinish = true;
+        }
+        return `data: ${JSON.stringify({ ...chunk, model })}`;
+      }
     } catch {
       // Not JSON: relay the line as it came.
     }
@@ -287,6 +302,8 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  /** Whether a finish chunk has already been relayed on this stream: see frameWithModel. */
+  const finishState = { sawFinish: false };
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -296,12 +313,12 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
       while (at !== -1) {
         const frame = buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
+        yield frameWithModel(frame, model, finishState);
         at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
+    if (buffer.trim() !== '') yield frameWithModel(buffer, model, finishState);
   } finally {
     reader.releaseLock();
   }
@@ -310,7 +327,9 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
 /**
  * A Chat Completions SSE stream as the Anthropic event sequence: message_start on the first chunk,
  * content_block_start/delta/stop per text block or tool call, then message_delta with the stop reason and
- * usage, then message_stop. `model` is the id the entry dialled, named back to the client.
+ * usage, then message_stop. `model` is the id the entry dialled, named back to the client. A provider
+ * that sends two finish chunks collapses to one message_stop here (finishEvents runs once), so the
+ * Anthropic wire never carries the double finish the OpenAI wire normalises in frameWithModel.
  */
 export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();

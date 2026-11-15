@@ -48,7 +48,11 @@
 //   Only when the same model refuses twice (or refuses once with a non-transient status) is
 //   the prompt retried on the next candidate in the ranking, and the model demoted behind
 //   every model that has not refused yet for the rest of the trial, only tried again when no
-//   fresh candidate remains for a prompt. Every refusal is recorded as a {status, code,
+//   fresh candidate remains for a prompt — subject to the per-prompt dial budget: a prompt
+//   spends at most MAX_DIALS_PER_PROMPT dials in total, so when the retry itself refuses
+//   the prompt ends unserved instead of walking further. The next prompt starts fresh with
+//   the demotion state the refusals left behind, so a storm that clears mid-trial still
+//   serves the later prompts. Every refusal is recorded as a {status, code,
 //   model} row and sent back on the response's `x-makefun-upstream-failures` header (at most
 //   8 rows, in refusal order) — the only way the failover column can see a refusal that was
 //   retried and then served. Refusals do not count toward the tie-break's upstream_calls
@@ -69,13 +73,19 @@
 //   forwarded are the provider's own, and the `model` field on every answer and streamed
 //   chunk is the id this server actually dialled.
 //
-// STREAMING — BUFFER, VERIFY, THEN EMIT
+// STREAMING — BUFFER, VERIFY, THEN EMIT, WITH EXACTLY ONE FINISH CHUNK
 //   A streaming prompt is dialled with stream:true, but the gateway's SSE is buffered in
 //   full before anything is sent to the client: only after the token check passes does this
 //   server emit the buffered frames (OpenAI: the frames relayed with the dialled model id;
 //   Anthropic: translated through anthropicEventsFromOpenAI over the buffered body). A
 //   stream that fails verification never reaches the client, so a bad first model costs one
 //   upstream call and never a lost prompt. Buffering stays far under the 30 s/prompt cap.
+//   The OpenAI relay also normalises the stream to one finish chunk: super-vl really sends
+//   two (one without usage, one with), and the client fails a stream carrying two finish
+//   chunks, so frameWithModel nulls the second finish_reason out (usage and
+//   native_finish_reason stay). The Anthropic relay already collapses a double finish to
+//   one message_stop. Live trials 1-2 each lost their one OpenAI-stream prompt to this
+//   (wire 95, served 5/6); the mock's --double-finish mode reproduces it.
 //
 // THE WIRES
 //   POST /v1/chat/completions (OpenAI) and POST /v1/messages (Anthropic), JSON or SSE.
@@ -87,10 +97,27 @@
 //   (x-api-key means Anthropic, Authorization means OpenAI) with exactly the fourteen free ids.
 //   `node main.ts --list` prints the same catalog the register body carries, byte for byte.
 //
-// DETERMINISM
-//   No wall clock, no randomness: routing is a function of the requests and the gateway's
-//   answers seen so far (plus which models have refused, which is itself a function of those
-//   answers), so a replay with the same brief reproduces the export byte for byte.
+// DETERMINISM — NO WALL CLOCK, NO RANDOMNESS, AND NO DIAL THAT OUTLIVES ITS PROMPT
+//   Routing is a function of the requests and the gateway's answers seen so far (plus which
+//   models have refused, which is itself a function of those answers), so a replay with the
+//   same brief reproduces the export byte for byte — but only if no dial outlives its prompt.
+//   Live trial-0 (2026-11-15) proved the failure mode: a 70-second gateway storm made every
+//   dial take ~10 s (the relay's connect timeout), the client's 30 s/prompt cap aborted p01
+//   and p02 while their handlers kept dialling as orphans for 50-80 s, and three handlers
+//   ran at once sharing the refused-model set. The replay, sequential and instant, demoted
+//   ultra before p03 ran, so p03 never dialled it — two cassette entries (p03's ultra dials)
+//   were left unconsumed and the trial was void. The dial order between concurrent handlers
+//   was pure wall-clock luck (p03's ultra dial beat p02's ultra retry by 37 ms).
+//   The fix is a bound, not a hope: MAX_DIALS_PER_PROMPT = 2 and DIAL_TIMEOUT_MS = 12000 mean
+//   one prompt's whole walk takes at most 2 x 12 s = 24 s, always inside the client's 30 s
+//   cap, so a handler can never be orphaned and handlers can never overlap. Prompts are
+//   also served strictly one at a time, in arrival order (a FIFO chain around serve), as
+//   defence in depth for any path the bound does not cover. A wall-clock TIME budget would
+//   not do: live and replay measure different seconds, so a time cut would take different
+//   dials in each pass; a dial COUNT is the same in both. Retry-once is kept (it is what
+//   saved p03 live, lightning 502 -> 200 as the storm cleared); retrying a third time is
+//   not: in the storm every model refused twice in a row, so a third dial would still be a
+//   refusal, and 3 x 12 s = 36 s would break the 30 s cap again.
 //
 // TRIAL SHAPE
 //   Listen on 0.0.0.0 at a free port, POST $MAKEFUN_ENV_URL/register {protocol_version: 1,
@@ -132,8 +159,19 @@ const POLL_INTERVAL_MS = 100;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 /** The trial's cap on gateway calls: this server never spends more in one trial. */
 const MAX_UPSTREAM_CALLS = 60;
-/** One gateway dial may not hang past this; a hung call is a refusal like any other. */
-const DIAL_TIMEOUT_MS = 25000;
+/**
+ * The most upstream dials one prompt may spend, counting the first dial and its same-model
+ * retry together: a prompt that still refuses after its retry ends unserved instead of
+ * walking the ranking. Two is the whole point of the number — see DETERMINISM.
+ */
+const MAX_DIALS_PER_PROMPT = 2;
+/**
+ * One gateway dial may not hang past this; a hung call is a refusal like any other. Twelve
+ * seconds sits just above the relay's own connect timeout (its 502 arrives at ~10 s), so a
+ * refusal the cassette records is always one this server actually received, while two hung
+ * dials (2 x 12 s) still finish inside the client's 30 s/prompt budget.
+ */
+const DIAL_TIMEOUT_MS = 12000;
 /** The most refusal rows the failures header carries, in refusal order. */
 const MAX_FAILURE_ROWS = 8;
 
@@ -438,8 +476,13 @@ async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' |
     return sendError(res, wire, 503, wire === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model in the brief meets this request');
   }
   const failures: FailureRow[] = [];
+  // Dials spent on this prompt, first dial and same-model retry together: the walk ends
+  // when the budget is spent, even mid-ranking (see DETERMINISM — a prompt's whole walk
+  // must finish inside the client's 30 s/prompt cap, or its handler outlives the prompt
+  // and the replay diverges).
+  let dials = 0;
   for (const candidate of candidates) {
-    if (upstreamCalls >= MAX_UPSTREAM_CALLS) break;
+    if (dials >= MAX_DIALS_PER_PROMPT || upstreamCalls >= MAX_UPSTREAM_CALLS) break;
     const upstreamBody: Json = wire === 'openai' ? { ...body, model: candidate.id } : anthropicToOpenAI(body, candidate.id);
     // One candidate, up to two dials: the first dial, plus one immediate same-model retry
     // when the first refusal was transient (429, 5xx, or a fetch error). A 400/401 refusal
@@ -448,9 +491,10 @@ async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' |
     let upstream: Response | null = null;
     let refused = false;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      if (upstreamCalls >= MAX_UPSTREAM_CALLS) break;
+      if (dials >= MAX_DIALS_PER_PROMPT || upstreamCalls >= MAX_UPSTREAM_CALLS) break;
       let response: Response;
       try {
+        dials += 1;
         upstreamCalls += 1;
         response = await dial(candidate.id, upstreamBody);
       } catch (err) {
@@ -553,12 +597,31 @@ async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' |
 
 /** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that serves it. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  await serve(req, res, 'openai');
+  await serveSerialized(req, res, 'openai');
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  await serve(req, res, 'anthropic');
+  await serveSerialized(req, res, 'anthropic');
+}
+
+/**
+ * Prompts are served strictly one at a time, in arrival order: a prompt's handler runs only
+ * after the previous prompt's handler has finished, so two handlers can never share the
+ * refused-model set or the manifest counter at once. With the per-prompt dial budget the
+ * chain is normally empty — a handler finishes inside its 30 s window, before the client
+ * sends the next prompt — so this is defence in depth for any path the bound does not
+ * cover. The chain itself never rejects, so one prompt's failure cannot stall the next.
+ * GET /v1/models is not serialised: it carries no prompt state and must answer at once.
+ */
+let serveChain: Promise<void> = Promise.resolve();
+function serveSerialized(req: IncomingMessage, res: ServerResponse, wire: 'openai' | 'anthropic'): Promise<void> {
+  const run = serveChain.then(() => serve(req, res, wire));
+  serveChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
