@@ -17,6 +17,19 @@
 //   rating per prompt already accounts for capabilities (1303 for the JSON prompts, 1475 for
 //   the rest), so serving each prompt with its first candidate earns the full quality bound.
 //
+// CONCRETE ATTEMPT ORDER, PER PROMPT CLASS (rating_milli in parentheses)
+//   JSON-mode (p01, p04 — only json:true models qualify):
+//     nemotron-3.5-super-vl (1303) -> gemma-4-31b (1210) -> ernie-5.5-flash (1150) ->
+//     dots-3-note (1150) -> gemma-4-26b (1150) -> ling-3.2-flash (1150) -> lfm-3-1.7b (1150)
+//     -> particle-1 (1150) -> flint-v1.0 (1150).
+//   Plain and tools prompts (p02, p03, p05, p06 — every model qualifies, tools:true on all):
+//     inkling-2-small (1475) -> nemotron-3.5-super-vl (1303) -> nemotron-3-ultra-550b (1285)
+//     -> nemotron-3.5-lightning (1221) -> gemma-4-31b (1210) -> north-mini-code (1200) ->
+//     the eight 1150-rated models in brief order.
+//   A model that refused earlier in the trial is demoted behind every not-yet-refused model
+//   in the same list, so a later prompt never spends its first call on a model that already
+//   proved it cannot answer — unless nothing else is left.
+//
 // FAILOVER — SEQUENTIAL, AND A REFUSAL IS REMEMBERED FOR THE WHOLE TRIAL
 //   A gateway call answered 4xx/5xx, or a fetch that never completes, is not an answer: the
 //   prompt is retried on the next candidate in the ranking. Every refusal is recorded as a
@@ -481,7 +494,8 @@ async function serve(req: IncomingMessage, res: ServerResponse, wire: 'openai' |
       log(`completion from ${candidate.id} is not one JSON object; failing over`);
       continue;
     }
-    const text = wire === 'openai' ? openAITextOf(answer) : openAITextOf(answer);
+    // The gateway always answers in Chat Completions shape, on both client wires.
+    const text = openAITextOf(answer);
     if (!textServes(text, token, jsonRequired)) {
       log(`completion from ${candidate.id} carries no token; failing over`);
       continue;
